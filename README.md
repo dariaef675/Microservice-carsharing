@@ -41,16 +41,14 @@
 
 Инфраструктура: API Gateway (аутентификация по JWT, rate limiting), брокер Apache Kafka, Identity Provider (Keycloak).
 
-## Предлагаемое разделение в команде (3-4 человека)
+
+## Предлагаемое разделение реализации (часть 2)
 
 | Участник | Зона ответственности |
 |---|---|
 | 1 | Rental Service (сага), Kafka-инфраструктура, outbox-библиотека |
-| 2 | Billing Service и мок PSP |
-| 3 | Fleet Service и Telematics Gateway с симулятором машин |
-| 4 | User Service, Notification Service, API Gateway, docker-compose, наблюдаемость |
-
-Если в команде три человека, четвёртую зону делят между вторым и третьим участником.
+| 2 | Billing Service и мок PSP, User Service, Notification Service |
+| 3 | Fleet Service и Telematics Gateway с симулятором машин, API Gateway, docker-compose, наблюдаемость |
 
 ## Глоссарий
 

@@ -1,0 +1,151 @@
+openapi: 3.0.3
+info:
+  title: User Service API
+  version: 1.0.0
+  description: |
+    Водители и допуск к аренде. Аутентификацию выполняет Keycloak; `userId` = `sub` из JWT.
+    Флаг долга обновляется асинхронно по событиям `PaymentFailed` / `DebtSettled` из Billing.
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+servers:
+  - url: https://api.poehali.example/v1
+    description: публичный (через gateway)
+  - url: http://user-service:8080
+    description: внутренний
+tags:
+  - name: me
+    description: Профиль текущего пользователя
+  - name: internal
+    description: Внутренние эндпоинты для других сервисов (client-credentials JWT, только сервисная сеть)
+paths:
+  /me:
+    get:
+      tags: [me]
+      operationId: getMe
+      summary: Мой профиль
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Профиль
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Driver' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /me/license:
+    put:
+      tags: [me]
+      operationId: submitLicense
+      summary: Отправить водительское удостоверение на проверку
+      description: Проверка во внешнем KYC асинхронная; результат придёт push-уведомлением, статус виден в `GET /me`.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LicenseSubmission' }
+      responses:
+        '202':
+          description: Принято на проверку
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Driver' }
+        '400':
+          description: Неверные данные
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /internal/users/{userId}/eligibility:
+    get:
+      tags: [internal]
+      security:
+        - serviceAuth: [internal]
+      operationId: getEligibility
+      summary: Может ли пользователь арендовать прямо сейчас
+      description: Вызывается Rental Service перед созданием брони. Таймаут на стороне клиента 500 мс.
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Результат проверки
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Eligibility' }
+        '404':
+          description: Пользователь не найден
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+components:
+  securitySchemes:
+    serviceAuth:
+      type: oauth2
+      description: Межсервисные вызовы с JWT, выданным Keycloak по client credentials
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.poehali.example/realms/poehali/protocol/openid-connect/token
+          scopes:
+            internal: Вызов внутренних эндпоинтов
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    LicenseStatus:
+      type: string
+      enum: [NOT_SUBMITTED, PENDING, VERIFIED, REJECTED, EXPIRED]
+    Driver:
+      type: object
+      required: [id, phone, licenseStatus, hasDebt, blocked]
+      properties:
+        id: { type: string, format: uuid }
+        phone: { type: string, example: '+79990001122' }
+        fullName: { type: string }
+        licenseStatus: { $ref: '#/components/schemas/LicenseStatus' }
+        licenseExpiresAt: { type: string, format: date, nullable: true }
+        hasDebt: { type: boolean }
+        blocked: { type: boolean }
+    LicenseSubmission:
+      type: object
+      required: [number, issuedAt, expiresAt, photoUploadIds]
+      properties:
+        number: { type: string, example: '77 12 345678' }
+        issuedAt: { type: string, format: date }
+        expiresAt: { type: string, format: date }
+        photoUploadIds:
+          type: array
+          minItems: 2
+          items: { type: string }
+    Eligibility:
+      type: object
+      required: [userId, eligible, reasons, checkedAt]
+      properties:
+        userId: { type: string, format: uuid }
+        eligible: { type: boolean }
+        reasons:
+          type: array
+          items:
+            type: string
+            enum: [LICENSE_NOT_VERIFIED, LICENSE_EXPIRED, DRIVER_BLOCKED, HAS_DEBT]
+        checkedAt: { type: string, format: date-time }
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        code: { type: string }
+        detail: { type: string }
+  responses:
+    Unauthorized:
+      description: Нет или неверный токен
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }

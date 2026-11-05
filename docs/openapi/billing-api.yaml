@@ -1,0 +1,328 @@
+openapi: 3.0.3
+info:
+  title: Billing Service API
+  version: 1.0.0
+  description: |
+    Тарифы, счета и платёжные операции. Все операции с PSP идемпотентны: ключ идемпотентности PSP
+    строится детерминированно как `{rentalId}:{operation}` (`hold`, `capture`, `charge-extra`, `void`,
+    `refund-{n}`), поэтому повтор после таймаута никогда не создаёт второе списание.
+
+    **Hold** ставится синхронно при бронировании (`POST /internal/holds`).
+    **Capture** выполняется асинхронно по событию `RentalFinished` (см. AsyncAPI).
+    **Release** (void) используется как компенсация. Он идемпотентен и может прийти раньше, чем PSP
+    подтвердит hold. Тогда Billing помечает hold `VOID_REQUESTED` и отменяет его сразу после подтверждения.
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+servers:
+  - url: https://api.poehali.example/v1
+    description: публичный (через gateway)
+  - url: http://billing-service:8080
+    description: внутренний
+tags:
+  - name: tariffs
+    description: Тарифы
+  - name: payment-methods
+    description: Привязанные карты
+  - name: invoices
+    description: Счета за поездки
+  - name: debts
+    description: Долги
+  - name: internal
+    description: Внутренние эндпоинты для других сервисов (client-credentials JWT, только сервисная сеть)
+  - name: webhooks
+    description: Вебхуки платёжного шлюза
+paths:
+  /tariffs:
+    get:
+      tags: [tariffs]
+      operationId: listTariffs
+      summary: Действующие тарифы
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: carClass
+          in: query
+          schema: { type: string, enum: [ECONOMY, COMFORT, BUSINESS] }
+      responses:
+        '200':
+          description: Тарифы
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Tariff' }
+        '401':
+          description: Нет или неверный токен
+  /me/payment-methods:
+    post:
+      tags: [payment-methods]
+      operationId: bindCard
+      summary: Привязать карту
+      description: Возвращает URL платёжной страницы PSP (3-D Secure). Токен карты хранится только у PSP, у нас хранится `paymentMethodId`.
+      security:
+        - bearerAuth: []
+      responses:
+        '201':
+          description: Сессия привязки создана
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [confirmationUrl]
+                properties:
+                  confirmationUrl: { type: string, format: uri }
+        '401':
+          description: Нет или неверный токен
+    get:
+      tags: [payment-methods]
+      operationId: listPaymentMethods
+      summary: Мои карты
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Карты
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/PaymentMethod' }
+        '401':
+          description: Нет или неверный токен
+  /me/invoices/{rentalId}:
+    get:
+      tags: [invoices]
+      operationId: getInvoice
+      summary: Чек за поездку
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/RentalIdPath'
+      responses:
+        '200':
+          description: Счёт
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Invoice' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /me/debts/{debtId}/pay:
+    post:
+      tags: [debts]
+      operationId: payDebt
+      summary: Погасить долг вручную
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: debtId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                paymentMethodId: { type: string }
+      responses:
+        '202':
+          description: Платёж отправлен в PSP, результат придёт событием `DebtSettled` и push-уведомлением
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /internal/holds:
+    post:
+      tags: [internal]
+      security:
+        - serviceAuth: [internal]
+      operationId: placeHold
+      summary: Поставить hold под аренду
+      description: |
+        Идемпотентно по `rentalId` (и заголовку `Idempotency-Key`, равному `rentalId`).
+        Billing ждёт ответа PSP не более 8 с. Если за это время результата нет, возвращается `503`,
+        а hold остаётся в статусе `UNKNOWN`. Rental обязан вызвать `DELETE /internal/holds/{rentalId}`,
+        reconciler дождётся финального статуса и отменит hold, если он всё-таки прошёл.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PlaceHoldRequest' }
+      responses:
+        '201':
+          description: Hold поставлен
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Hold' }
+        '200':
+          description: Hold для этой аренды уже существует (повтор)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Hold' }
+        '402':
+          description: "`HOLD_DECLINED`: банк отказал; `NO_PAYMENT_METHOD`: нет привязанной карты"
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '503':
+          description: PSP не ответил вовремя, результат неизвестен
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /internal/holds/{rentalId}:
+    parameters:
+      - $ref: '#/components/parameters/RentalIdPath'
+    delete:
+      tags: [internal]
+      security:
+        - serviceAuth: [internal]
+      operationId: releaseHold
+      summary: Отменить hold (компенсация)
+      description: Идемпотентно. `204` и если hold отменён, и если его не было.
+      responses:
+        '204':
+          description: Hold отменён или будет отменён после подтверждения PSP
+        '409':
+          description: Hold уже списан (capture), отменить нельзя, нужен refund
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+  /webhooks/psp:
+    post:
+      tags: [webhooks]
+      operationId: pspWebhook
+      summary: Уведомление от платёжного шлюза
+      description: |
+        Проверяется подпись `X-PSP-Signature` (HMAC-SHA256) и allow-list IP.
+        Обработка идемпотентна по `pspEventId`. Отвечаем `200` сразу после записи в inbox,
+        бизнес-обработка идёт асинхронно.
+      security: []
+      parameters:
+        - name: X-PSP-Signature
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PspWebhook' }
+      responses:
+        '200':
+          description: Принято
+        '401':
+          description: Неверная подпись
+components:
+  securitySchemes:
+    serviceAuth:
+      type: oauth2
+      description: Межсервисные вызовы с JWT, выданным Keycloak по client credentials
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.poehali.example/realms/poehali/protocol/openid-connect/token
+          scopes:
+            internal: Вызов внутренних эндпоинтов
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string }
+    RentalIdPath:
+      name: rentalId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+  schemas:
+    Tariff:
+      type: object
+      required: [code, carClass, currency, driveMinuteKopecks, freeReservationMinutes, holdAmountKopecks]
+      properties:
+        code: { type: string, example: BASE_MINUTE }
+        carClass: { type: string, enum: [ECONOMY, COMFORT, BUSINESS] }
+        currency: { type: string, enum: [RUB] }
+        driveMinuteKopecks: { type: integer, example: 1290 }
+        freeReservationMinutes: { type: integer, example: 20 }
+        holdAmountKopecks: { type: integer, example: 100000 }
+    PaymentMethod:
+      type: object
+      required: [id, maskedPan, default]
+      properties:
+        id: { type: string }
+        maskedPan: { type: string, example: '220220******1234' }
+        default: { type: boolean }
+    PlaceHoldRequest:
+      type: object
+      required: [rentalId, userId, amountKopecks]
+      properties:
+        rentalId: { type: string, format: uuid }
+        userId: { type: string, format: uuid }
+        amountKopecks: { type: integer, minimum: 1 }
+    HoldStatus:
+      type: string
+      enum: [PENDING, HELD, UNKNOWN, VOID_REQUESTED, VOIDED, CAPTURED, DECLINED]
+    Hold:
+      type: object
+      required: [rentalId, status, amountKopecks]
+      properties:
+        rentalId: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/HoldStatus' }
+        amountKopecks: { type: integer }
+        pspPaymentId: { type: string, nullable: true }
+        expiresAt:
+          type: string
+          format: date-time
+          description: Банк автоматически снимает hold через ~7 дней
+    InvoiceLine:
+      type: object
+      required: [kind, quantity, unitPriceKopecks, amountKopecks]
+      properties:
+        kind: { type: string, enum: [DRIVE, PENALTY, DISCOUNT] }
+        quantity: { type: number, description: Минуты или штуки }
+        unitPriceKopecks: { type: integer }
+        amountKopecks: { type: integer }
+    Invoice:
+      type: object
+      required: [rentalId, status, lines, totalKopecks, paidKopecks]
+      properties:
+        rentalId: { type: string, format: uuid }
+        status: { type: string, enum: [CALCULATED, PAID, PARTIALLY_PAID, DEBT] }
+        lines:
+          type: array
+          items: { $ref: '#/components/schemas/InvoiceLine' }
+        totalKopecks: { type: integer }
+        paidKopecks: { type: integer }
+        debtId: { type: string, format: uuid, nullable: true }
+        receiptUrl: { type: string, format: uri, nullable: true }
+    PspWebhook:
+      type: object
+      required: [pspEventId, type, pspPaymentId, idempotenceKey, status]
+      properties:
+        pspEventId: { type: string }
+        type: { type: string, enum: [payment.waiting_for_capture, payment.succeeded, payment.canceled, refund.succeeded] }
+        pspPaymentId: { type: string }
+        idempotenceKey: { type: string, example: '3f1c…:capture' }
+        status: { type: string }
+        amountKopecks: { type: integer }
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        code: { type: string }
+        detail: { type: string }
+  responses:
+    NotFound:
+      description: Не найдено
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }

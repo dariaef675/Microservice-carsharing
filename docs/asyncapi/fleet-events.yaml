@@ -1,0 +1,72 @@
+asyncapi: 3.0.0
+info:
+  title: События автопарка (Fleet Service)
+  version: 1.0.0
+  description: |
+    Fleet подписан на `telematics.telemetry` (координаты, топливо) и `rental.events`
+    (`RentalStarted` → IN_TRIP, `RentalFinished` → AVAILABLE) и публикует собственные факты.
+
+    `CarReservationLapsed` служит страховкой (ADR-0004): если резерв не снят и не
+    переведён в поездку до `leaseUntil` (например, Rental потерял таймер), Fleet сам
+    освобождает машину и сообщает об этом. Rental, получив событие для аренды в RESERVED,
+    переводит её в EXPIRED и отменяет hold. Для аренды в любом другом статусе событие игнорируется.
+servers:
+  kafka:
+    host: kafka:9092
+    protocol: kafka
+defaultContentType: application/json
+channels:
+  fleetEvents:
+    address: fleet.events
+    description: Ключ партиции carId, 12 партиций, retention 7 дней.
+    messages:
+      CarReservationLapsed: { $ref: '#/components/messages/CarReservationLapsed' }
+      CarStatusChanged: { $ref: '#/components/messages/CarStatusChanged' }
+    bindings:
+      kafka:
+        topic: fleet.events
+        partitions: 12
+        replicas: 3
+        bindingVersion: '0.5.0'
+operations:
+  publishFleetEvents:
+    action: send
+    channel: { $ref: '#/channels/fleetEvents' }
+components:
+  messageTraits:
+    CarKey:
+      bindings:
+        kafka:
+          key: { type: string, format: uuid, description: carId }
+          bindingVersion: '0.5.0'
+  messages:
+    CarReservationLapsed:
+      name: CarReservationLapsed
+      title: Страховочный срок резерва истёк, машина освобождена
+      traits:
+        - $ref: './common.yaml#/components/messageTraits/EventEnvelope'
+        - $ref: '#/components/messageTraits/CarKey'
+      payload:
+        type: object
+        required: [carId, rentalId, leaseUntil, lapsedAt]
+        properties:
+          carId: { type: string, format: uuid }
+          rentalId: { type: string, format: uuid }
+          leaseUntil: { type: string, format: date-time }
+          lapsedAt: { type: string, format: date-time }
+    CarStatusChanged:
+      name: CarStatusChanged
+      title: Изменился статус машины
+      description: Для консоли оператора и аналитики; в саге аренды не участвует.
+      traits:
+        - $ref: './common.yaml#/components/messageTraits/EventEnvelope'
+        - $ref: '#/components/messageTraits/CarKey'
+      payload:
+        type: object
+        required: [carId, from, to, version]
+        properties:
+          carId: { type: string, format: uuid }
+          from: { type: string, enum: [AVAILABLE, RESERVED, IN_TRIP, NEEDS_INSPECTION, MAINTENANCE, OFFLINE] }
+          to: { type: string, enum: [AVAILABLE, RESERVED, IN_TRIP, NEEDS_INSPECTION, MAINTENANCE, OFFLINE] }
+          rentalId: { type: string, format: uuid }
+          version: { type: integer }

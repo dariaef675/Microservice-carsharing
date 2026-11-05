@@ -1,0 +1,183 @@
+asyncapi: 3.0.0
+info:
+  title: События аренды (Rental Service)
+  version: 1.0.0
+  description: |
+    Факты жизненного цикла аренды. Публикуются через transactional outbox (ADR-0002),
+    доставка at-least-once, порядок сохраняется в пределах `rentalId` (ключ партиции).
+
+    | Событие | Консьюмеры | Что делают |
+    |---|---|---|
+    | RentalReserved | Notification | push «Машина забронирована на 20 мин» |
+    | RentalStarted | Fleet, Notification | Fleet: RESERVED → IN_TRIP |
+    | RentalStartFailed | Notification | push «Машина не открылась, бронь отменена, деньги не списаны» |
+    | RentalCancelled | Notification | push об отмене брони |
+    | RentalExpired | Notification | push об истечении брони |
+    | RentalFinished | Billing, Fleet, Notification | Billing: расчёт и capture; Fleet: IN_TRIP → AVAILABLE |
+    | RentalClosed | Notification | итоговый чек |
+
+    Компенсации (снять резерв, отменить hold) Rental выполняет **синхронными идемпотентными
+    вызовами**, а не через эти события. События только сообщают о факте.
+servers:
+  kafka:
+    host: kafka:9092
+    protocol: kafka
+    description: Кластер Kafka (3 брокера, RF=3, min.insync.replicas=2)
+defaultContentType: application/json
+channels:
+  rentalEvents:
+    address: rental.events
+    description: Ключ записи rentalId, 12 партиций, retention 7 дней.
+    messages:
+      RentalReserved: { $ref: '#/components/messages/RentalReserved' }
+      RentalStarted: { $ref: '#/components/messages/RentalStarted' }
+      RentalStartFailed: { $ref: '#/components/messages/RentalStartFailed' }
+      RentalCancelled: { $ref: '#/components/messages/RentalCancelled' }
+      RentalExpired: { $ref: '#/components/messages/RentalExpired' }
+      RentalFinished: { $ref: '#/components/messages/RentalFinished' }
+      RentalClosed: { $ref: '#/components/messages/RentalClosed' }
+    bindings:
+      kafka:
+        topic: rental.events
+        partitions: 12
+        replicas: 3
+        bindingVersion: '0.5.0'
+operations:
+  publishRentalEvents:
+    action: send
+    channel: { $ref: '#/channels/rentalEvents' }
+    summary: Rental публикует факты жизненного цикла аренды
+    messages:
+      - $ref: '#/channels/rentalEvents/messages/RentalReserved'
+      - $ref: '#/channels/rentalEvents/messages/RentalStarted'
+      - $ref: '#/channels/rentalEvents/messages/RentalStartFailed'
+      - $ref: '#/channels/rentalEvents/messages/RentalCancelled'
+      - $ref: '#/channels/rentalEvents/messages/RentalExpired'
+      - $ref: '#/channels/rentalEvents/messages/RentalFinished'
+      - $ref: '#/channels/rentalEvents/messages/RentalClosed'
+components:
+  messageTraits:
+    RentalKey:
+      bindings:
+        kafka:
+          key: { type: string, format: uuid, description: rentalId }
+          bindingVersion: '0.5.0'
+  schemas:
+    RentalBase:
+      type: object
+      required: [rentalId, userId, carId]
+      properties:
+        rentalId: { type: string, format: uuid }
+        userId: { type: string, format: uuid }
+        carId: { type: string, format: uuid }
+  messages:
+    RentalReserved:
+      name: RentalReserved
+      title: Машина забронирована
+      traits:
+        - $ref: './common.yaml#/components/messageTraits/EventEnvelope'
+        - $ref: '#/components/messageTraits/RentalKey'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RentalBase'
+          - type: object
+            required: [tariff, reservationExpiresAt]
+            properties:
+              tariff: { $ref: './common.yaml#/components/schemas/TariffSnapshot' }
+              reservationExpiresAt: { type: string, format: date-time }
+    RentalStarted:
+      name: RentalStarted
+      title: Поездка началась (машина открыта)
+      traits:
+        - $ref: './common.yaml#/components/messageTraits/EventEnvelope'
+        - $ref: '#/components/messageTraits/RentalKey'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RentalBase'
+          - type: object
+            required: [startedAt, odometerStartMeters]
+            properties:
+              startedAt: { type: string, format: date-time }
+              odometerStartMeters: { type: integer }
+    RentalStartFailed:
+      name: RentalStartFailed
+      title: Машина не открылась, аренда отменена
+      traits:
+        - $ref: './common.yaml#/components/messageTraits/EventEnvelope'
+        - $ref: '#/components/messageTraits/RentalKey'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RentalBase'
+          - type: object
+            required: [reason]
+            properties:
+              reason: { type: string, enum: [CAR_UNREACHABLE, CAR_COMMAND_REJECTED] }
+              commandId: { type: string, format: uuid }
+    RentalCancelled:
+      name: RentalCancelled
+      title: Бронь отменена
+      traits:
+        - $ref: './common.yaml#/components/messageTraits/EventEnvelope'
+        - $ref: '#/components/messageTraits/RentalKey'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RentalBase'
+          - type: object
+            required: [reason]
+            properties:
+              reason: { type: string, enum: [USER_CANCELLED, OPERATOR_CANCELLED] }
+    RentalExpired:
+      name: RentalExpired
+      title: Бесплатная бронь истекла
+      traits:
+        - $ref: './common.yaml#/components/messageTraits/EventEnvelope'
+        - $ref: '#/components/messageTraits/RentalKey'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RentalBase'
+          - type: object
+            required: [expiredAt, trigger]
+            properties:
+              expiredAt: { type: string, format: date-time }
+              trigger:
+                type: string
+                enum: [RENTAL_TIMER, FLEET_LEASE_LAPSED]
+                description: Кто заметил истечение (собственный таймер Rental или страховочный lease во Fleet)
+    RentalFinished:
+      name: RentalFinished
+      title: Поездка завершена, машина закрыта
+      description: |
+        Главный вход для Billing. Содержит всё, что нужно для расчёта, поэтому Billing не ходит
+        за данными в Rental (event-carried state transfer).
+      traits:
+        - $ref: './common.yaml#/components/messageTraits/EventEnvelope'
+        - $ref: '#/components/messageTraits/RentalKey'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RentalBase'
+          - type: object
+            required: [tariff, startedAt, finishedAt, durationSeconds, distanceMeters, finishPosition]
+            properties:
+              tariff: { $ref: './common.yaml#/components/schemas/TariffSnapshot' }
+              startedAt: { type: string, format: date-time }
+              finishedAt:
+                type: string
+                format: date-time
+                description: Время из подтверждения LockCar от машины, а не время нажатия кнопки
+              durationSeconds: { type: integer, minimum: 0 }
+              distanceMeters: { type: integer, minimum: 0 }
+              finishPosition: { $ref: './common.yaml#/components/schemas/GeoPoint' }
+    RentalClosed:
+      name: RentalClosed
+      title: Аренда полностью закрыта (оплачена)
+      traits:
+        - $ref: './common.yaml#/components/messageTraits/EventEnvelope'
+        - $ref: '#/components/messageTraits/RentalKey'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/RentalBase'
+          - type: object
+            required: [totalCostKopecks, closedAt]
+            properties:
+              totalCostKopecks: { type: integer }
+              closedAt: { type: string, format: date-time }

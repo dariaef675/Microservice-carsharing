@@ -1,0 +1,297 @@
+openapi: 3.0.3
+info:
+  title: Fleet Service API
+  version: 1.0.0
+  description: |
+    Автопарк. Единственный владелец статуса машины.
+
+    Публичная часть (`/cars`) доступна через API Gateway. Внутренняя часть (`/internal/...`) доступна
+    только из сервисной сети (mTLS), вызывается Rental Service.
+
+    **Инвариант «у машины не больше одной аренды»** обеспечивается атомарным
+    `UPDATE cars SET status='RESERVED', rental_id=:rid WHERE id=:id AND status='AVAILABLE'`
+    (см. ADR-0004). Резерв идемпотентен по `rentalId`.
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+servers:
+  - url: https://api.poehali.example/v1
+    description: публичный (через gateway)
+  - url: http://fleet-service:8080
+    description: внутренний
+tags:
+  - name: cars
+    description: Публичный поиск и карточки машин
+  - name: internal
+    description: Внутренние эндпоинты для других сервисов (client-credentials JWT, только сервисная сеть)
+  - name: operator
+    description: Действия оператора автопарка
+paths:
+  /cars:
+    get:
+      tags: [cars]
+      operationId: searchCars
+      summary: Свободные машины рядом
+      security:
+        - bearerAuth: []
+      parameters:
+        - { name: lat, in: query, required: true, schema: { type: number, format: double, minimum: -90, maximum: 90 } }
+        - { name: lon, in: query, required: true, schema: { type: number, format: double, minimum: -180, maximum: 180 } }
+        - { name: radiusMeters, in: query, schema: { type: integer, minimum: 100, maximum: 5000, default: 1500 } }
+        - { name: carClass, in: query, schema: { $ref: '#/components/schemas/CarClass' } }
+      responses:
+        '200':
+          description: Машины в статусе AVAILABLE, отсортированные по расстоянию
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/CarSummary' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+  /cars/{carId}:
+    parameters:
+      - $ref: '#/components/parameters/CarId'
+    get:
+      tags: [cars]
+      operationId: getCar
+      summary: Карточка машины
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Машина
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Car' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /internal/cars/{carId}/reservations:
+    parameters:
+      - $ref: '#/components/parameters/CarId'
+    post:
+      tags: [internal]
+      security:
+        - serviceAuth: [internal]
+      operationId: reserveCar
+      summary: Зарезервировать машину под аренду
+      description: |
+        Идемпотентно по `rentalId`: повторный вызов с тем же `rentalId` вернёт `200` и существующий
+        резерв. Если машина занята другой арендой, возвращается `409`.
+        `leaseUntil` задаёт страховочный срок: если Rental не подтвердит старт и не снимет резерв
+        до этого момента, Fleet сам освободит машину и опубликует `CarReservationLapsed`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReserveCarRequest' }
+      responses:
+        '201':
+          description: Резерв создан
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CarReservation' }
+        '200':
+          description: Резерв с этим rentalId уже существует (повтор)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CarReservation' }
+        '409':
+          description: "`CAR_NOT_AVAILABLE`: машина занята, на обслуживании или офлайн"
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /internal/cars/{carId}/reservations/{rentalId}:
+    parameters:
+      - $ref: '#/components/parameters/CarId'
+      - $ref: '#/components/parameters/RentalId'
+    delete:
+      tags: [internal]
+      security:
+        - serviceAuth: [internal]
+      operationId: releaseCar
+      summary: Снять резерв (компенсация)
+      description: Идемпотентно. Если резерва нет или он принадлежит другой аренде, возвращается `204` и ничего не меняется.
+      parameters:
+        - name: reason
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [CANCELLED, EXPIRED, HOLD_FAILED, START_FAILED]
+        - name: markForInspection
+          in: query
+          schema: { type: boolean, default: false }
+          description: Перевести машину в NEEDS_INSPECTION вместо AVAILABLE (например, машина не ответила на команду)
+      responses:
+        '204':
+          description: Резерв снят (или его уже не было)
+        '401':
+          description: Нет или неверный токен
+  /internal/cars/{carId}/finish-check:
+    parameters:
+      - $ref: '#/components/parameters/CarId'
+    get:
+      tags: [internal]
+      security:
+        - serviceAuth: [internal]
+      operationId: finishCheck
+      summary: Можно ли завершить поездку в текущей точке
+      description: По последней телеметрии (не старше 30 с) и полигонам зон парковки.
+      responses:
+        '200':
+          description: Результат проверки
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FinishCheck' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /operator/cars/{carId}/status:
+    parameters:
+      - $ref: '#/components/parameters/CarId'
+    put:
+      tags: [operator]
+      operationId: setCarServiceStatus
+      summary: Вывести машину на обслуживание / вернуть на линию
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status, expectedVersion]
+              properties:
+                status:
+                  type: string
+                  enum: [AVAILABLE, MAINTENANCE]
+                comment: { type: string }
+                expectedVersion: { type: integer }
+      responses:
+        '200':
+          description: Статус изменён
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Car' }
+        '409':
+          description: Машина в аренде или версия устарела
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+components:
+  securitySchemes:
+    serviceAuth:
+      type: oauth2
+      description: Межсервисные вызовы с JWT, выданным Keycloak по client credentials
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.poehali.example/realms/poehali/protocol/openid-connect/token
+          scopes:
+            internal: Вызов внутренних эндпоинтов
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    CarId:
+      name: carId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    RentalId:
+      name: rentalId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+  schemas:
+    CarClass:
+      type: string
+      enum: [ECONOMY, COMFORT, BUSINESS]
+    CarStatus:
+      type: string
+      enum: [AVAILABLE, RESERVED, IN_TRIP, NEEDS_INSPECTION, MAINTENANCE, OFFLINE]
+    GeoPoint:
+      type: object
+      required: [lat, lon]
+      properties:
+        lat: { type: number, format: double }
+        lon: { type: number, format: double }
+    CarSummary:
+      type: object
+      required: [id, model, plate, carClass, position, fuelPercent]
+      properties:
+        id: { type: string, format: uuid }
+        model: { type: string, example: Kia Rio }
+        plate: { type: string, example: А123ВС777 }
+        carClass: { $ref: '#/components/schemas/CarClass' }
+        position: { $ref: '#/components/schemas/GeoPoint' }
+        fuelPercent: { type: integer, minimum: 0, maximum: 100 }
+        distanceMeters: { type: integer }
+    Car:
+      allOf:
+        - $ref: '#/components/schemas/CarSummary'
+        - type: object
+          required: [status, version]
+          properties:
+            status: { $ref: '#/components/schemas/CarStatus' }
+            currentRentalId: { type: string, format: uuid, nullable: true }
+            lastSeenAt: { type: string, format: date-time }
+            version: { type: integer }
+    ReserveCarRequest:
+      type: object
+      required: [rentalId, userId, leaseUntil]
+      properties:
+        rentalId: { type: string, format: uuid }
+        userId: { type: string, format: uuid }
+        leaseUntil:
+          type: string
+          format: date-time
+          description: Страховочный срок резерва (бесплатная бронь + 5 минут)
+    CarReservation:
+      type: object
+      required: [carId, rentalId, leaseUntil, createdAt]
+      properties:
+        carId: { type: string, format: uuid }
+        rentalId: { type: string, format: uuid }
+        leaseUntil: { type: string, format: date-time }
+        createdAt: { type: string, format: date-time }
+    FinishCheck:
+      type: object
+      required: [allowed, violations, position, telemetryAt]
+      properties:
+        allowed: { type: boolean }
+        violations:
+          type: array
+          items:
+            type: string
+            enum: [OUTSIDE_PARKING_ZONE, DOOR_OPEN, ENGINE_RUNNING, TELEMETRY_STALE]
+        position: { $ref: '#/components/schemas/GeoPoint' }
+        telemetryAt: { type: string, format: date-time }
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        code: { type: string }
+        detail: { type: string }
+        traceId: { type: string }
+  responses:
+    BadRequest:
+      description: Неверные параметры
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: Машина не найдена
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }

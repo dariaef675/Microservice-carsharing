@@ -1,0 +1,188 @@
+asyncapi: 3.0.0
+info:
+  title: Команды машинам и события от них (Telematics Gateway)
+  version: 1.0.0
+  description: |
+    Telematics владеет своим командным API: принимает команды из `telematics.commands`,
+    публикует результаты в `telematics.events` и поток телеметрии в `telematics.telemetry`.
+
+    **Семантика команды.** Каждая команда несёт `commandId` (дедупликация) и `deadline`.
+    Gateway повторяет отправку провайдеру с экспоненциальным бэкоффом (1, 2, 4, 8… с) до
+    `deadline`. Если подтверждения нет, публикует `CarCommandFailed{reason: TIMEOUT}`.
+    Если подтверждение пришло после дедлайна, всё равно публикует `CarUnlocked`/`CarLocked`
+    с `lateAfterTimeout: true`, а Rental решает, нужна ли компенсация.
+
+    Ключ партиции `carId`, поэтому команды одной машине обрабатываются строго по порядку
+    (Unlock не обгонит Lock).
+servers:
+  kafka:
+    host: kafka:9092
+    protocol: kafka
+defaultContentType: application/json
+channels:
+  telematicsCommands:
+    address: telematics.commands
+    description: Команды машинам. Продюсер Rental Service, 24 партиции, retention 1 день.
+    messages:
+      UnlockCar: { $ref: '#/components/messages/UnlockCar' }
+      LockCar: { $ref: '#/components/messages/LockCar' }
+    bindings:
+      kafka:
+        topic: telematics.commands
+        partitions: 24
+        replicas: 3
+        bindingVersion: '0.5.0'
+  telematicsEvents:
+    address: telematics.events
+    description: Результаты команд. Консьюмер Rental Service.
+    messages:
+      CarUnlocked: { $ref: '#/components/messages/CarUnlocked' }
+      CarLocked: { $ref: '#/components/messages/CarLocked' }
+      CarCommandFailed: { $ref: '#/components/messages/CarCommandFailed' }
+    bindings:
+      kafka:
+        topic: telematics.events
+        partitions: 24
+        replicas: 3
+        bindingVersion: '0.5.0'
+  telematicsTelemetry:
+    address: telematics.telemetry
+    description: |
+      Нормализованная телеметрия (точка раз в 5-10 с на машину). Консьюмер Fleet.
+      Доставка at-least-once, дубликаты и устаревшие точки Fleet отбрасывает по `ts`.
+    messages:
+      CarTelemetryReported: { $ref: '#/components/messages/CarTelemetryReported' }
+    bindings:
+      kafka:
+        topic: telematics.telemetry
+        partitions: 48
+        replicas: 3
+        bindingVersion: '0.5.0'
+operations:
+  receiveCommands:
+    action: receive
+    channel: { $ref: '#/channels/telematicsCommands' }
+    summary: Gateway принимает команды Unlock/Lock (consumer group telematics-gateway)
+  publishCommandResults:
+    action: send
+    channel: { $ref: '#/channels/telematicsEvents' }
+    summary: Gateway сообщает результат исполнения команды
+  publishTelemetry:
+    action: send
+    channel: { $ref: '#/channels/telematicsTelemetry' }
+    summary: Gateway публикует нормализованную телеметрию
+components:
+  messageTraits:
+    CarKey:
+      bindings:
+        kafka:
+          key: { type: string, format: uuid, description: carId }
+          bindingVersion: '0.5.0'
+  schemas:
+    CommandBase:
+      type: object
+      required: [commandId, carId, rentalId, deadline]
+      properties:
+        commandId:
+          type: string
+          format: uuid
+          description: Генерирует Rental; повтор с тем же commandId не исполняется повторно
+        carId: { type: string, format: uuid }
+        rentalId: { type: string, format: uuid }
+        deadline:
+          type: string
+          format: date-time
+          description: После этого момента Gateway прекращает попытки (unlock через 60 с, lock через 120 с)
+    CommandResultBase:
+      type: object
+      required: [commandId, carId, rentalId, executedAt, odometerMeters, lateAfterTimeout]
+      properties:
+        commandId: { type: string, format: uuid }
+        carId: { type: string, format: uuid }
+        rentalId: { type: string, format: uuid }
+        executedAt: { type: string, format: date-time, description: Время по часам машины }
+        odometerMeters: { type: integer }
+        position: { $ref: './common.yaml#/components/schemas/GeoPoint' }
+        lateAfterTimeout:
+          type: boolean
+          description: true, если подтверждение пришло после того, как уже был опубликован CarCommandFailed(TIMEOUT)
+  messages:
+    UnlockCar:
+      name: UnlockCar
+      title: Открыть машину и разрешить запуск двигателя
+      traits:
+        - $ref: './common.yaml#/components/messageTraits/EventEnvelope'
+        - $ref: '#/components/messageTraits/CarKey'
+      payload:
+        $ref: '#/components/schemas/CommandBase'
+    LockCar:
+      name: LockCar
+      title: Закрыть машину и заблокировать запуск двигателя
+      traits:
+        - $ref: './common.yaml#/components/messageTraits/EventEnvelope'
+        - $ref: '#/components/messageTraits/CarKey'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/CommandBase'
+          - type: object
+            required: [purpose]
+            properties:
+              purpose:
+                type: string
+                enum: [FINISH_TRIP, COMPENSATION]
+                description: COMPENSATION означает закрыть машину, которая открылась после отмены аренды
+    CarUnlocked:
+      name: CarUnlocked
+      title: Машина открыта
+      traits:
+        - $ref: './common.yaml#/components/messageTraits/EventEnvelope'
+        - $ref: '#/components/messageTraits/CarKey'
+      payload:
+        $ref: '#/components/schemas/CommandResultBase'
+    CarLocked:
+      name: CarLocked
+      title: Машина закрыта
+      traits:
+        - $ref: './common.yaml#/components/messageTraits/EventEnvelope'
+        - $ref: '#/components/messageTraits/CarKey'
+      payload:
+        $ref: '#/components/schemas/CommandResultBase'
+    CarCommandFailed:
+      name: CarCommandFailed
+      title: Команда не исполнена
+      traits:
+        - $ref: './common.yaml#/components/messageTraits/EventEnvelope'
+        - $ref: '#/components/messageTraits/CarKey'
+      payload:
+        type: object
+        required: [commandId, carId, rentalId, commandType, reason, attempts]
+        properties:
+          commandId: { type: string, format: uuid }
+          carId: { type: string, format: uuid }
+          rentalId: { type: string, format: uuid }
+          commandType: { type: string, enum: [UNLOCK, LOCK] }
+          reason:
+            type: string
+            enum: [TIMEOUT, REJECTED, DEVICE_ERROR]
+            description: TIMEOUT (нет подтверждения до deadline) или REJECTED (машина отказала, например открыта дверь при LOCK)
+          errorCode: { type: string, examples: [DOOR_OPEN, ENGINE_RUNNING, LOW_BATTERY] }
+          attempts: { type: integer }
+    CarTelemetryReported:
+      name: CarTelemetryReported
+      title: Точка телеметрии
+      traits:
+        - $ref: './common.yaml#/components/messageTraits/EventEnvelope'
+        - $ref: '#/components/messageTraits/CarKey'
+      payload:
+        type: object
+        required: [carId, ts, position, odometerMeters, engineOn, doorsClosed, locked]
+        properties:
+          carId: { type: string, format: uuid }
+          ts: { type: string, format: date-time }
+          position: { $ref: './common.yaml#/components/schemas/GeoPoint' }
+          speedKmh: { type: number }
+          fuelPercent: { type: integer, minimum: 0, maximum: 100 }
+          odometerMeters: { type: integer }
+          engineOn: { type: boolean }
+          doorsClosed: { type: boolean }
+          locked: { type: boolean }

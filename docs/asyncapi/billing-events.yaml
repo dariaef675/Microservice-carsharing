@@ -1,0 +1,110 @@
+asyncapi: 3.0.0
+info:
+  title: Платёжные события (Billing Service)
+  version: 1.0.0
+  description: |
+    Billing подписан на `rental.events` (consumer group `billing`, обрабатывает только
+    `RentalFinished`) и публикует итог расчёта.
+
+    **Exactly-once эффект при at-least-once доставке.** `RentalFinished` может прийти дважды,
+    но у `invoices` есть `UNIQUE(rental_id)`, и второй раз счёт не создаётся. Операции с PSP
+    идут с детерминированными ключами `{rentalId}:capture` и `{rentalId}:charge-extra`.
+
+    | Событие | Консьюмеры | Что делают |
+    |---|---|---|
+    | PaymentCaptured | Rental, Notification | Rental: PAYMENT_PENDING → CLOSED; Notification: чек |
+    | PaymentFailed | Rental, User, Notification | Rental → DEBT; User: hasDebt = true; push о долге |
+    | DebtSettled | Rental, User, Notification | Rental: DEBT → CLOSED; User: hasDebt = false |
+servers:
+  kafka:
+    host: kafka:9092
+    protocol: kafka
+defaultContentType: application/json
+channels:
+  billingEvents:
+    address: billing.events
+    description: Ключ партиции rentalId, 12 партиций, retention 30 дней.
+    messages:
+      PaymentCaptured: { $ref: '#/components/messages/PaymentCaptured' }
+      PaymentFailed: { $ref: '#/components/messages/PaymentFailed' }
+      DebtSettled: { $ref: '#/components/messages/DebtSettled' }
+    bindings:
+      kafka:
+        topic: billing.events
+        partitions: 12
+        replicas: 3
+        bindingVersion: '0.5.0'
+operations:
+  publishBillingEvents:
+    action: send
+    channel: { $ref: '#/channels/billingEvents' }
+    summary: Billing сообщает итог оплаты поездки и погашение долгов
+components:
+  messageTraits:
+    RentalKey:
+      bindings:
+        kafka:
+          key: { type: string, format: uuid, description: rentalId }
+          bindingVersion: '0.5.0'
+  messages:
+    PaymentCaptured:
+      name: PaymentCaptured
+      title: Поездка полностью оплачена
+      traits:
+        - $ref: './common.yaml#/components/messageTraits/EventEnvelope'
+        - $ref: '#/components/messageTraits/RentalKey'
+      payload:
+        type: object
+        required: [rentalId, userId, invoiceId, totalKopecks, capturedFromHoldKopecks, extraChargedKopecks]
+        properties:
+          rentalId: { type: string, format: uuid }
+          userId: { type: string, format: uuid }
+          invoiceId: { type: string, format: uuid }
+          totalKopecks: { type: integer }
+          capturedFromHoldKopecks:
+            type: integer
+            description: Списано из hold (min(total, hold)); остаток hold освобождён
+          extraChargedKopecks:
+            type: integer
+            description: Доп. списание с карты, если total > hold
+          receiptUrl: { type: string, format: uri }
+    PaymentFailed:
+      name: PaymentFailed
+      title: Оплата прошла не полностью, открыт долг
+      traits:
+        - $ref: './common.yaml#/components/messageTraits/EventEnvelope'
+        - $ref: '#/components/messageTraits/RentalKey'
+      payload:
+        type: object
+        required: [rentalId, userId, invoiceId, totalKopecks, paidKopecks, debtId, debtKopecks, reason]
+        properties:
+          rentalId: { type: string, format: uuid }
+          userId: { type: string, format: uuid }
+          invoiceId: { type: string, format: uuid }
+          totalKopecks: { type: integer }
+          paidKopecks: { type: integer }
+          debtId: { type: string, format: uuid }
+          debtKopecks: { type: integer, minimum: 1 }
+          reason: { type: string, enum: [INSUFFICIENT_FUNDS, CARD_EXPIRED, BANK_DECLINED, HOLD_EXPIRED] }
+          nextRetryAt:
+            type: string
+            format: date-time
+            description: Когда Billing автоматически повторит списание (1 ч, 6 ч, 24 ч, затем раз в сутки)
+    DebtSettled:
+      name: DebtSettled
+      title: Долг погашен
+      traits:
+        - $ref: './common.yaml#/components/messageTraits/EventEnvelope'
+        - $ref: '#/components/messageTraits/RentalKey'
+      payload:
+        type: object
+        required: [rentalId, userId, debtId, amountKopecks, settledAt, userHasOtherDebts]
+        properties:
+          rentalId: { type: string, format: uuid }
+          userId: { type: string, format: uuid }
+          debtId: { type: string, format: uuid }
+          amountKopecks: { type: integer }
+          settledAt: { type: string, format: date-time }
+          userHasOtherDebts:
+            type: boolean
+            description: User снимает флаг hasDebt только если false

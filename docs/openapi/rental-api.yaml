@@ -1,0 +1,311 @@
+openapi: 3.0.3
+info:
+  title: Rental Service API
+  version: 1.0.0
+  description: |
+    Публичный API аренды (через API Gateway). Rental Service выступает оркестратором саги аренды.
+
+    **Идемпотентность.** `POST /rentals` требует заголовок `Idempotency-Key` (UUID, генерирует клиент
+    один раз на нажатие «Забронировать»). Повтор с тем же ключом и тем же телом в течение 24 ч
+    возвращает исходный ответ, с другим телом возвращает `422 IDEMPOTENCY_KEY_REUSED`.
+    Переходы `start`, `finish`, `cancel` идемпотентны по состоянию: повторный вызов в целевом
+    или более позднем состоянии возвращает текущее состояние аренды без побочных эффектов.
+
+    **Асинхронность.** `start` и `finish` возвращают `202 Accepted`: машина подтверждает команду
+    асинхронно. Клиент узнаёт результат из push-уведомления или опросом `GET /rentals/{rentalId}`.
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+servers:
+  - url: https://api.poehali.example/v1
+security:
+  - bearerAuth: []
+tags:
+  - name: rentals
+    description: Аренда (бронь, старт, завершение, отмена)
+paths:
+  /rentals:
+    post:
+      tags: [rentals]
+      operationId: createRental
+      summary: Забронировать машину
+      description: |
+        Синхронно проверяет допуск водителя (User), резервирует машину (Fleet) и ставит hold (Billing).
+        При ошибке на любом шаге уже выполненные шаги компенсируются до ответа клиенту.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRentalRequest'
+      responses:
+        '201':
+          description: Бронь создана, машина закреплена на 20 минут
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Rental'
+        '402':
+          $ref: '#/components/responses/HoldDeclined'
+        '403':
+          $ref: '#/components/responses/DriverNotEligible'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+    get:
+      tags: [rentals]
+      operationId: listMyRentals
+      summary: Мои аренды
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [active, finished]
+          description: "`active`: статусы от RESERVED до PAYMENT_PENDING и DEBT; `finished`: терминальные статусы"
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: cursor
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Список аренд
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Rental'
+                  nextCursor:
+                    type: string
+                    nullable: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /rentals/{rentalId}:
+    parameters:
+      - $ref: '#/components/parameters/RentalId'
+    get:
+      tags: [rentals]
+      operationId: getRental
+      summary: Состояние аренды
+      responses:
+        '200':
+          description: Аренда
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Rental'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /rentals/{rentalId}/start:
+    parameters:
+      - $ref: '#/components/parameters/RentalId'
+    post:
+      tags: [rentals]
+      operationId: startRental
+      summary: Начать поездку (открыть машину)
+      description: |
+        Переводит аренду RESERVED → STARTING и отправляет команду `UnlockCar` в Telematics.
+        Переход в ACTIVE происходит после события `CarUnlocked`.
+      responses:
+        '202':
+          description: Команда на открытие отправлена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Rental'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /rentals/{rentalId}/finish:
+    parameters:
+      - $ref: '#/components/parameters/RentalId'
+    post:
+      tags: [rentals]
+      operationId: finishRental
+      summary: Завершить поездку (закрыть машину)
+      description: |
+        Проверяет условия завершения через Fleet (зона парковки, двери, двигатель), переводит
+        ACTIVE → FINISHING и отправляет команду `LockCar`. После `CarLocked` аренда переходит
+        в PAYMENT_PENDING и публикуется `RentalFinished`.
+      responses:
+        '202':
+          description: Команда на закрытие отправлена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Rental'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          description: Завершение невозможно (вне зоны парковки, открыта дверь, заведён двигатель)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /rentals/{rentalId}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/RentalId'
+    post:
+      tags: [rentals]
+      operationId: cancelRental
+      summary: Отменить бронь
+      description: Только из состояния RESERVED. Снимает резерв машины и hold.
+      responses:
+        '200':
+          description: Бронь отменена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Rental'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        format: uuid
+    RentalId:
+      name: rentalId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+  schemas:
+    CreateRentalRequest:
+      type: object
+      required: [carId, tariffCode]
+      properties:
+        carId:
+          type: string
+          format: uuid
+        tariffCode:
+          type: string
+          example: BASE_MINUTE
+    RentalStatus:
+      type: string
+      description: |
+        CREATING → RESERVED → STARTING → ACTIVE → FINISHING → PAYMENT_PENDING → CLOSED.
+        Ветви: REJECTED (бронь не удалось создать, шаги компенсированы), CANCELLED (отмена брони),
+        EXPIRED (бронь истекла), START_FAILED (машина не открылась), DEBT (поездка завершена,
+        оплата прошла не полностью). Диаграмма состояний в docs/04-main-process.md.
+      enum: [CREATING, RESERVED, STARTING, ACTIVE, FINISHING, PAYMENT_PENDING, CLOSED, REJECTED, CANCELLED, EXPIRED, START_FAILED, DEBT]
+    TariffSnapshot:
+      type: object
+      description: Тариф, зафиксированный в момент бронирования (не меняется до конца аренды)
+      required: [code, currency, driveMinuteKopecks, freeReservationMinutes, holdAmountKopecks]
+      properties:
+        code: { type: string }
+        currency: { type: string, enum: [RUB] }
+        driveMinuteKopecks: { type: integer, example: 1290 }
+        freeReservationMinutes: { type: integer, example: 20 }
+        holdAmountKopecks: { type: integer, example: 100000 }
+    Rental:
+      type: object
+      required: [id, userId, carId, status, tariff, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        userId: { type: string, format: uuid }
+        carId: { type: string, format: uuid }
+        status:
+          $ref: '#/components/schemas/RentalStatus'
+        tariff:
+          $ref: '#/components/schemas/TariffSnapshot'
+        createdAt: { type: string, format: date-time }
+        reservationExpiresAt: { type: string, format: date-time, nullable: true }
+        startedAt: { type: string, format: date-time, nullable: true }
+        finishedAt: { type: string, format: date-time, nullable: true }
+        totalCostKopecks:
+          type: integer
+          nullable: true
+          description: Заполняется после расчёта в Billing
+        failureReason:
+          type: string
+          nullable: true
+          enum: [CAR_NOT_AVAILABLE, HOLD_DECLINED, HOLD_UNKNOWN, DEPENDENCY_UNAVAILABLE, CAR_UNREACHABLE, CAR_COMMAND_REJECTED, RESERVATION_LAPSED, INSUFFICIENT_FUNDS, null]
+        version:
+          type: integer
+          description: Версия агрегата (для оптимистичной блокировки и отладки)
+    Problem:
+      type: object
+      description: RFC 7807 Problem Details
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        code:
+          type: string
+          description: Машиночитаемый код ошибки
+          example: CAR_NOT_AVAILABLE
+        detail: { type: string }
+        traceId: { type: string }
+  responses:
+    Unauthorized:
+      description: Нет или неверный токен
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: Аренда не найдена или принадлежит другому пользователю
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Conflict:
+      description: |
+        `CAR_NOT_AVAILABLE`: машину уже забронировали;
+        `ACTIVE_RENTAL_EXISTS`: у пользователя уже есть активная аренда;
+        `INVALID_STATE_TRANSITION`: переход невозможен из текущего статуса.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    DriverNotEligible:
+      description: "`LICENSE_NOT_VERIFIED`, `DRIVER_BLOCKED`, `HAS_DEBT`"
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    HoldDeclined:
+      description: Банк отклонил предавторизацию (`HOLD_DECLINED`)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unprocessable:
+      description: "`IDEMPOTENCY_KEY_REUSED`, `UNKNOWN_TARIFF`"
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unavailable:
+      description: Зависимый сервис недоступен; бронь не создана, все шаги компенсированы. Можно повторить с тем же Idempotency-Key.
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }

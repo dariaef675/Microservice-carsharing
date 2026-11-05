@@ -1,0 +1,144 @@
+openapi: 3.0.3
+info:
+  title: Telematics Gateway API
+  version: 1.0.0
+  description: |
+    Антикоррупционный слой между доменом и IoT-платформой провайдера.
+
+    Команды машинам Telematics получает **не по REST**, а из Kafka-топика `telematics.commands`
+    (см. AsyncAPI), поэтому команда не теряется, если Gateway перезапускается.
+    Здесь описаны только:
+    - колбэки, которые вызывает провайдер (результат команды, телеметрия);
+    - служебный эндпоинт для операторов и отладки.
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+servers:
+  - url: https://telematics-hooks.poehali.example
+    description: вебхуки провайдера
+  - url: http://telematics-gateway:8080
+    description: внутренний
+tags:
+  - name: provider-webhooks
+    description: Колбэки телематического провайдера
+  - name: internal
+    description: Внутренние эндпоинты для других сервисов (client-credentials JWT, только сервисная сеть)
+paths:
+  /webhooks/provider/command-results:
+    post:
+      tags: [provider-webhooks]
+      operationId: providerCommandResult
+      summary: Результат исполнения команды на машине
+      description: |
+        Провайдер может прислать один результат несколько раз, обработка идемпотентна по
+        `providerCommandId`. Если `SUCCESS` пришёл для команды, уже помеченной `TIMED_OUT`,
+        Gateway всё равно публикует `CarUnlocked` / `CarLocked`: решение о компенсации принимает
+        Rental (см. сценарий сбоя 1, запоздавшее открытие).
+      security:
+        - providerHmac: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProviderCommandResult' }
+      responses:
+        '200':
+          description: Принято
+        '401':
+          description: Неверная подпись
+  /webhooks/provider/telemetry:
+    post:
+      tags: [provider-webhooks]
+      operationId: providerTelemetryBatch
+      summary: Пачка точек телеметрии
+      security:
+        - providerHmac: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [points]
+              properties:
+                points:
+                  type: array
+                  maxItems: 1000
+                  items: { $ref: '#/components/schemas/ProviderTelemetryPoint' }
+      responses:
+        '200':
+          description: Принято
+        '401':
+          description: Неверная подпись
+  /internal/commands/{commandId}:
+    get:
+      tags: [internal]
+      security:
+        - serviceAuth: [internal]
+      operationId: getCommand
+      summary: Статус команды (для оператора и отладки)
+      parameters:
+        - name: commandId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Команда
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CarCommand' }
+        '404':
+          description: Не найдена
+components:
+  securitySchemes:
+    serviceAuth:
+      type: oauth2
+      description: Межсервисные вызовы с JWT, выданным Keycloak по client credentials
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.poehali.example/realms/poehali/protocol/openid-connect/token
+          scopes:
+            internal: Вызов внутренних эндпоинтов
+    providerHmac:
+      type: apiKey
+      in: header
+      name: X-Provider-Signature
+      description: HMAC-SHA256 тела запроса общим секретом
+  schemas:
+    ProviderCommandResult:
+      type: object
+      required: [providerCommandId, deviceId, result, executedAt]
+      properties:
+        providerCommandId: { type: string }
+        deviceId: { type: string }
+        result: { type: string, enum: [SUCCESS, REJECTED, DEVICE_ERROR] }
+        errorCode: { type: string, nullable: true, example: DOOR_OPEN }
+        executedAt: { type: string, format: date-time }
+        odometerMeters: { type: integer }
+    ProviderTelemetryPoint:
+      type: object
+      required: [deviceId, ts, lat, lon]
+      properties:
+        deviceId: { type: string }
+        ts: { type: string, format: date-time }
+        lat: { type: number, format: double }
+        lon: { type: number, format: double }
+        speedKmh: { type: number }
+        fuelPercent: { type: integer }
+        odometerMeters: { type: integer }
+        engineOn: { type: boolean }
+        doorsClosed: { type: boolean }
+        locked: { type: boolean }
+    CarCommand:
+      type: object
+      required: [commandId, carId, rentalId, type, status, attempts, deadline]
+      properties:
+        commandId: { type: string, format: uuid }
+        carId: { type: string, format: uuid }
+        rentalId: { type: string, format: uuid }
+        type: { type: string, enum: [UNLOCK, LOCK] }
+        status: { type: string, enum: [RECEIVED, SENT, SUCCEEDED, FAILED, TIMED_OUT] }
+        attempts: { type: integer }
+        deadline: { type: string, format: date-time }
+        lastError: { type: string, nullable: true }

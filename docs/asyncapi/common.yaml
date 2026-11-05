@@ -1,0 +1,56 @@
+# Общие части AsyncAPI-контрактов: конверт события (Kafka-заголовки) и общие схемы.
+# Это фрагмент, а не самостоятельный AsyncAPI-документ; на него ссылаются *-events.yaml.
+components:
+  messageTraits:
+    EventEnvelope:
+      headers:
+        type: object
+        description: |
+          Передаётся в заголовках Kafka-записи. Консьюмер дедуплицирует по `eventId`
+          (таблица inbox с UNIQUE(event_id)), см. ADR-0002.
+        required: [eventId, eventType, occurredAt, producer, correlationId, schemaVersion]
+        properties:
+          eventId:
+            type: string
+            format: uuid
+            description: Уникальный id события; генерируется при записи в outbox
+          eventType:
+            type: string
+            examples: [RentalFinished]
+          occurredAt:
+            type: string
+            format: date-time
+          producer:
+            type: string
+            examples: [rental-service]
+          correlationId:
+            type: string
+            format: uuid
+            description: id саги (равен rentalId), сквозной для логов и трейсинга
+          causationId:
+            type: string
+            format: uuid
+            description: eventId или commandId, который вызвал это событие
+          schemaVersion:
+            type: integer
+            minimum: 1
+            description: Версия схемы payload. Ломающие изменения вносятся только через новый eventType
+          traceparent:
+            type: string
+            description: W3C Trace Context
+  schemas:
+    GeoPoint:
+      type: object
+      required: [lat, lon]
+      properties:
+        lat: { type: number }
+        lon: { type: number }
+    TariffSnapshot:
+      type: object
+      required: [code, currency, driveMinuteKopecks, freeReservationMinutes, holdAmountKopecks]
+      properties:
+        code: { type: string }
+        currency: { type: string, enum: [RUB] }
+        driveMinuteKopecks: { type: integer }
+        freeReservationMinutes: { type: integer }
+        holdAmountKopecks: { type: integer }
